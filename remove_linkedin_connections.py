@@ -48,8 +48,8 @@ CSV_FILE_PATH = os.path.join(PROJECT_ROOT, "data", "Connections.csv")
 OUTPUT_DEBUG_DIR = os.path.join(PROJECT_ROOT, "output", "debug")
 RESULTS_CSV = os.path.join(PROJECT_ROOT, "output", "results.csv")
 
-MIN_DELAY = 6
-MAX_DELAY = 14
+MIN_DELAY = 2
+MAX_DELAY = 4
 DRY_RUN = False
 PROFILE_MARKER_FILENAME = "profile_initialized.txt"
 
