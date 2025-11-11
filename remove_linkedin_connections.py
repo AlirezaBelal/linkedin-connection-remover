@@ -2,33 +2,26 @@
 # -*- coding: utf-8 -*-
 
 """
-LinkedIn Connection Remover - Clean Version
-Author: AlirezaBelal
-Date: 2025-11-11
-
-Features:
-- Removes processed connections from CSV
-- Clean English messaging
-- Better error handling
-- Progress tracking
+Automated LinkedIn connection remover.
+- Creates a chrome-user-data folder next to the script and caches session.
+- Launches a separate Chrome process with remote debugging and attaches chromedriver.
+- Reads input URLs from output/Other.csv (column "URL").
+- Writes results to output/results.csv and saves snapshots to output/debug/.
+- Set DRY_RUN = True to simulate actions without performing removals.
 """
 
 from __future__ import annotations
 
 import csv
-import logging
 import os
 import random
 import re
 import shutil
 import socket
 import subprocess
-import sys
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Tuple, Optional
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -36,8 +29,6 @@ from selenium import webdriver
 from selenium.common.exceptions import (
     StaleElementReferenceException,
     SessionNotCreatedException,
-    TimeoutException,
-    WebDriverException
 )
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -46,633 +37,543 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
-# Fix Unicode encoding for Windows console
-if sys.platform == "win32":
-    import codecs
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
-    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach())
-    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.detach())
+CHROME_USER_DATA_DIR = os.path.join(PROJECT_ROOT, "chrome-user-data")
+CHROME_PROFILE_DIR = "Default"
+CHROME_BINARY = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 
+CSV_FILE_PATH = os.path.join(PROJECT_ROOT, "data", "Connections.csv")
+OUTPUT_DEBUG_DIR = os.path.join(PROJECT_ROOT, "output", "debug")
+RESULTS_CSV = os.path.join(PROJECT_ROOT, "output", "results.csv")
 
-@dataclass
-class Config:
-    """Configuration settings"""
-    # Paths
-    PROJECT_ROOT: str = os.path.dirname(os.path.abspath(__file__))
-    CHROME_USER_DATA_DIR: str = os.path.join(PROJECT_ROOT, "chrome-user-data")
-    CHROME_PROFILE_DIR: str = "Default"
-    CSV_FILE_PATH: str = os.path.join(PROJECT_ROOT, "data", "Connections.csv")
-    OUTPUT_DEBUG_DIR: str = os.path.join(PROJECT_ROOT, "output", "debug")
-    RESULTS_CSV: str = os.path.join(PROJECT_ROOT, "output", "results.csv")
-    BACKUP_CSV: str = os.path.join(PROJECT_ROOT, "data", "Connections_backup.csv")
+MIN_DELAY = 2
+MAX_DELAY = 4
+DRY_RUN = False
+PROFILE_MARKER_FILENAME = "profile_initialized.txt"
 
-    # Chrome settings
-    CHROME_BINARY: str = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-
-    # Timing
-    MIN_DELAY: float = 2.0
-    MAX_DELAY: float = 4.0
-    WAIT_TIMEOUT: int = 15
-
-    # Behavior
-    DRY_RUN: bool = False
-    MAX_RETRIES: int = 3
-    HEADLESS: bool = False
-    REMOVE_FROM_CSV: bool = True
-
-    # LinkedIn specific
-    PROFILE_MARKER_FILENAME: str = "profile_initialized.txt"
+os.makedirs(OUTPUT_DEBUG_DIR, exist_ok=True)
+os.makedirs(os.path.dirname(RESULTS_CSV), exist_ok=True)
 
 
-class Logger:
-    """Simple logging system"""
+def save_debug_snapshot(driver, name_prefix: str = "snapshot") -> Tuple[str, str]:
+    ts = int(time.time())
+    safe_prefix = re.sub(r"[^0-9a-zA-Z_-]", "_", name_prefix)[:60]
+    png_path = os.path.join(OUTPUT_DEBUG_DIR, f"{safe_prefix}_{ts}.png")
+    html_path = os.path.join(OUTPUT_DEBUG_DIR, f"{safe_prefix}_{ts}.html")
+    try:
+        driver.save_screenshot(png_path)
+    except Exception:
+        png_path = ""
+    try:
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(driver.page_source)
+    except Exception:
+        html_path = ""
+    return png_path, html_path
 
-    def __init__(self, name: str = "LinkedInRemover"):
-        self.logger = logging.getLogger(name)
-        self._setup_logging()
 
-    def _setup_logging(self):
-        """Setup logging"""
-        if self.logger.handlers:
-            return
+def profile_slug_from_url(url: str) -> str:
+    try:
+        p = urlparse(url).path.strip("/")
+        return p.split("/")[-1]
+    except Exception:
+        return "profile"
 
-        self.logger.setLevel(logging.INFO)
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
-        # File handler
+def find_free_port() -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("", 0))
+    addr, port = s.getsockname()
+    s.close()
+    return port
+
+
+def wait_for_port(host: str, port: int, timeout: float = 20.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         try:
-            file_handler = logging.FileHandler('linkedin_remover.log', encoding='utf-8')
-            file_handler.setFormatter(formatter)
-            self.logger.addHandler(file_handler)
-        except Exception:
-            pass
-
-        # Console handler
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setFormatter(formatter)
-        self.logger.addHandler(console_handler)
-
-    def info(self, message: str):
-        print(f"[INFO] {message}")
-        try:
-            self.logger.info(message)
-        except Exception:
-            pass
-
-    def error(self, message: str):
-        print(f"[ERROR] {message}")
-        try:
-            self.logger.error(message)
-        except Exception:
-            pass
-
-    def warning(self, message: str):
-        print(f"[WARNING] {message}")
-        try:
-            self.logger.warning(message)
-        except Exception:
-            pass
-
-
-class CSVManager:
-    """Manages CSV operations"""
-
-    def __init__(self, csv_path: str, backup_path: str, logger: Logger):
-        self.csv_path = csv_path
-        self.backup_path = backup_path
-        self.logger = logger
-        self._create_backup()
-
-    def _create_backup(self):
-        """Create backup of original CSV"""
-        try:
-            if os.path.exists(self.csv_path):
-                shutil.copy2(self.csv_path, self.backup_path)
-                self.logger.info(f"Backup created: {self.backup_path}")
-        except Exception as e:
-            self.logger.error(f"Backup failed: {e}")
-
-    def read_urls(self) -> List[str]:
-        """Read URLs from CSV file"""
-        try:
-            df = pd.read_csv(self.csv_path)
-            urls = df['URL'].dropna().tolist()
-            self.logger.info(f"Loaded {len(urls)} URLs from CSV")
-            return urls
-        except Exception as e:
-            self.logger.error(f"CSV read failed: {e}")
-            return []
-
-    def remove_url(self, url: str):
-        """Remove specific URL from CSV"""
-        try:
-            df = pd.read_csv(self.csv_path)
-            initial_count = len(df)
-            df = df[df['URL'] != url]
-            df.to_csv(self.csv_path, index=False)
-
-            if len(df) < initial_count:
-                self.logger.info(f"Removed from CSV: {url}")
+            with socket.create_connection((host, port), timeout=1):
                 return True
-            return False
-        except Exception as e:
-            self.logger.error(f"CSV remove failed: {e}")
-            return False
-
-    def get_remaining_count(self) -> int:
-        """Get count of remaining URLs"""
-        try:
-            df = pd.read_csv(self.csv_path)
-            return len(df['URL'].dropna())
         except Exception:
-            return 0
+            time.sleep(0.2)
+    return False
 
 
-class ChromeManager:
-    """Manages Chrome browser and WebDriver"""
-
-    def __init__(self, config: Config, logger: Logger):
-        self.config = config
-        self.logger = logger
-        self.driver: Optional[webdriver.Chrome] = None
-        self.wait: Optional[WebDriverWait] = None
-        self.chrome_process: Optional[subprocess.Popen] = None
-
-    def _find_free_port(self) -> int:
-        """Find available port"""
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
-
-    def _wait_for_port(self, host: str, port: int, timeout: float = 20.0) -> bool:
-        """Wait for port to become available"""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                with socket.create_connection((host, port), timeout=1):
-                    return True
-            except Exception:
-                time.sleep(0.2)
-        return False
-
-    def _find_chrome_binary(self) -> Optional[str]:
-        """Find Chrome executable"""
-        if self.config.CHROME_BINARY and os.path.exists(self.config.CHROME_BINARY):
-            return self.config.CHROME_BINARY
-
-        default_paths = [
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        ]
-
-        for path in default_paths:
-            if os.path.exists(path):
-                return path
-
-        return shutil.which("chrome") or shutil.which("google-chrome")
-
-    def _start_chrome_process(self, port: int) -> subprocess.Popen:
-        """Start Chrome process"""
-        chrome_binary = self._find_chrome_binary()
-        if not chrome_binary:
-            raise RuntimeError("Chrome not found")
-
-        args = [
-            chrome_binary,
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={self.config.CHROME_USER_DATA_DIR}",
-            f"--profile-directory={self.config.CHROME_PROFILE_DIR}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-extensions",
-            "--disable-sync",
-        ]
-
-        try:
-            return subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as e:
-            raise RuntimeError(f"Chrome start failed: {e}")
-
-    def _create_driver(self, port: int) -> webdriver.Chrome:
-        """Create WebDriver"""
-        options = Options()
-        options.debugger_address = f"127.0.0.1:{port}"
-        service = Service(ChromeDriverManager().install())
-
-        try:
-            return webdriver.Chrome(service=service, options=options)
-        except Exception as e:
-            raise SessionNotCreatedException(f"Driver creation failed: {e}")
-
-    def setup(self) -> Tuple[webdriver.Chrome, WebDriverWait]:
-        """Setup Chrome and WebDriver"""
-        os.makedirs(self.config.CHROME_USER_DATA_DIR, exist_ok=True)
-
-        port = self._find_free_port()
-        self.chrome_process = self._start_chrome_process(port)
-
-        if not self._wait_for_port("127.0.0.1", port, timeout=25.0):
-            self.cleanup()
-            raise RuntimeError("Chrome startup timeout")
-
-        self.driver = self._create_driver(port)
-        self.wait = WebDriverWait(self.driver, self.config.WAIT_TIMEOUT)
-
-        return self.driver, self.wait
-
-    def cleanup(self):
-        """Clean up resources"""
-        if self.driver:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
-
-        if self.chrome_process:
-            try:
-                self.chrome_process.terminate()
-            except Exception:
-                pass
+def pick_chrome_binary() -> Optional[str]:
+    if CHROME_BINARY and os.path.exists(CHROME_BINARY):
+        return CHROME_BINARY
+    default_win = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+    if os.path.exists(default_win):
+        return default_win
+    path = shutil.which("chrome") or shutil.which("google-chrome") or shutil.which("chromium")
+    return path
 
 
-class LinkedInProfileChecker:
-    """Check LinkedIn profile connection status"""
+def create_chrome_process(user_data_dir: str, profile_dir: str, port: int,
+                          chrome_binary: Optional[str]) -> subprocess.Popen:
+    args = []
+    if chrome_binary:
+        args.append(chrome_binary)
+    else:
+        args.append("chrome")
+    args += [
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={user_data_dir}",
+        f'--profile-directory={profile_dir}',
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-sync",
+        "--disable-translate",
+        "--disable-popup-blocking",
+        "--disable-background-timer-throttling",
+    ]
+    creationflags = 0
+    try:
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creationflags)
+    except Exception as e:
+        raise RuntimeError(f"Failed to start Chrome process: {e}")
+    return proc
 
-    def __init__(self, driver: webdriver.Chrome, wait: WebDriverWait, logger: Logger):
-        self.driver = driver
-        self.wait = wait
-        self.logger = logger
 
-    def is_connected(self) -> bool:
-        """Check if profile is connected"""
-        try:
-            time.sleep(0.6)
+def create_driver_attaching_to_chrome(port: int) -> webdriver.Chrome:
+    options = Options()
+    options.debugger_address = f"127.0.0.1:{port}"
+    service = Service(ChromeDriverManager().install())
+    try:
+        driver = webdriver.Chrome(service=service, options=options)
+    except SessionNotCreatedException as e:
+        raise SessionNotCreatedException(f"Failed to create WebDriver attached to Chrome debug port {port}: {e}")
+    return driver
 
-            # Check for 1st degree badge
-            one_badge = self.driver.find_elements(By.XPATH, "//*[contains(text(),'1st')]")
-            if one_badge:
-                return True
 
-            # Check for Connect button
-            connect_btns = self.driver.find_elements(By.XPATH, "//button[contains(.,'Connect')]")
-            if connect_btns:
-                return False
-
-            # Check for Message button
-            msg_btn = self.driver.find_elements(By.XPATH, "//button[contains(.,'Message')]")
-            if msg_btn:
-                return True
-
+def is_connected(driver: webdriver.Chrome) -> bool:
+    try:
+        time.sleep(0.6)
+        one_badge = driver.find_elements(By.XPATH,
+                                         "//*[contains(text(),'1st') or contains(text(),'1\u200fst') or contains(text(),'1\u202fst')]")
+        if one_badge:
             return True
-
-        except Exception:
+    except Exception:
+        pass
+    try:
+        connect_btns = driver.find_elements(By.XPATH,
+                                            "//button[.//span[contains(text(),'Connect')] or contains(.,'Connect')]")
+        if connect_btns:
+            msg = driver.find_elements(By.XPATH,
+                                       "//button[.//span[contains(text(),'Message')] or contains(.,'Message')]")
+            if msg:
+                return True
+            return False
+    except Exception:
+        pass
+    try:
+        msg_btn = driver.find_elements(By.XPATH,
+                                       "//button[.//span[contains(text(),'Message')] or contains(.,'Message')]")
+        if msg_btn:
             return True
+    except Exception:
+        pass
+    return True
 
 
-class LinkedInRemover:
-    """Main LinkedIn connection remover"""
+def find_click_more_button(driver: webdriver.Chrome, wait: WebDriverWait, debug: bool = False) -> bool:
+    try:
+        WebDriverWait(driver, 6).until(EC.presence_of_element_located((By.XPATH,
+                                                                       "//main//section[contains(@class,'pv-top-card') or contains(@class,'top-card') or contains(@class,'profile-topcard') or contains(@class,'pvs-sticky-header-profile-actions')]"
+                                                                       )))
+    except Exception:
+        pass
 
-    def __init__(self, driver: webdriver.Chrome, wait: WebDriverWait,
-                 config: Config, logger: Logger):
-        self.driver = driver
-        self.wait = wait
-        self.config = config
-        self.logger = logger
-        self.checker = LinkedInProfileChecker(driver, wait, logger)
+    candidates_xpaths = [
+        "//button[contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'more actions')]",
+        "//button[contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'more')]",
+        "//button[.//span[normalize-space(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'))='more']]",
+        "//button[.//span[normalize-space(text())='More']]",
+        "//button[contains(@id,'profile-overflow-action')]",
+        "//button[.//svg and (contains(@class,'ellipsis') or contains(@data-icon,'ellipsis') or contains(.,'...') or contains(.,'⋯'))]"
+    ]
 
-    def save_debug_snapshot(self, name_prefix: str = "snapshot") -> Tuple[str, str]:
-        """Save debug files"""
-        timestamp = int(time.time())
-        safe_prefix = re.sub(r"[^0-9a-zA-Z_-]", "_", name_prefix)[:60]
-
-        png_path = os.path.join(self.config.OUTPUT_DEBUG_DIR, f"{safe_prefix}_{timestamp}.png")
-        html_path = os.path.join(self.config.OUTPUT_DEBUG_DIR, f"{safe_prefix}_{timestamp}.html")
-
+    for xp in candidates_xpaths:
         try:
-            self.driver.save_screenshot(png_path)
+            elements = driver.find_elements(By.XPATH, xp)
+            for el in elements:
+                try:
+                    if not el.is_displayed():
+                        continue
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", el)
+                    time.sleep(0.12)
+                    driver.execute_script("arguments[0].click();", el)
+                    try:
+                        WebDriverWait(driver, 4).until(EC.presence_of_element_located((By.XPATH,
+                                                                                       "//div[@role='menu' or contains(@class,'artdeco-popover__content') or contains(@class,'artdeco-dropdown__content')]")))
+                    except Exception:
+                        time.sleep(0.6)
+                    return True
+                except Exception:
+                    continue
         except Exception:
-            png_path = ""
+            continue
 
+    if debug:
         try:
-            with open(html_path, "w", encoding="utf-8") as f:
-                f.write(self.driver.page_source)
+            all_buttons = driver.find_elements(By.XPATH, "//button")
+            print("---- debug: all buttons (text | aria-label | id | class) ----")
+            for i, b in enumerate(all_buttons[:300], 1):
+                try:
+                    txt = (b.text or "").strip()
+                    aria = b.get_attribute("aria-label") or ""
+                    bid = b.get_attribute("id") or ""
+                    cls = b.get_attribute("class") or ""
+                    print(f"{i:03d}: text='{txt}' | aria='{aria}' | id='{bid}' | class='{cls}'")
+                except Exception:
+                    pass
+            print("---- end debug ----")
         except Exception:
-            html_path = ""
-
-        return png_path, html_path
-
-    def _profile_slug_from_url(self, url: str) -> str:
-        """Extract profile slug from URL"""
-        try:
-            path = urlparse(url).path.strip("/")
-            return path.split("/")[-1]
-        except Exception:
-            return "profile"
-
-    def _find_more_button(self) -> bool:
-        """Find and click More button"""
-        try:
-            self.wait.until(EC.presence_of_element_located((By.XPATH, "//main")))
-        except TimeoutException:
             pass
 
-        more_button_xpaths = [
-            "//button[contains(@aria-label,'more') or contains(@aria-label,'More')]",
-            "//button[.//span[text()='More']]",
-            "//button[contains(@id,'overflow')]",
-            "//button[.//svg[contains(@class,'ellipsis')]]"
-        ]
+    return False
 
-        for xpath in more_button_xpaths:
-            try:
-                elements = self.driver.find_elements(By.XPATH, xpath)
-                for element in elements:
-                    if element.is_displayed():
-                        self.driver.execute_script("arguments[0].click();", element)
-                        time.sleep(0.5)
-                        return True
-            except Exception:
-                continue
 
+def find_and_click_menu_item_remove(driver: webdriver.Chrome, wait: WebDriverWait, dry_run: bool = False,
+                                    debug: bool = False) -> bool:
+    try:
+        WebDriverWait(driver, 6).until(EC.presence_of_element_located((By.XPATH,
+                                                                       "//div[@role='menu' or contains(@class,'artdeco-popover__content') or contains(@class,'artdeco-dropdown__content')]")))
+    except Exception:
         return False
-
-    def _find_remove_menu_item(self) -> bool:
-        """Find and click remove menu item"""
-        try:
-            self.wait.until(EC.presence_of_element_located((By.XPATH, "//div[@role='menu']")))
-        except TimeoutException:
-            return False
-
-        menu_items = self.driver.find_elements(By.XPATH, "//div[@role='menu']//button | //div[@role='menu']//a")
-
-        remove_keywords = ["remove connection", "disconnect", "remove"]
-
-        for item in menu_items:
-            try:
-                text = (item.text or "").strip().lower()
-                aria_label = (item.get_attribute("aria-label") or "").strip().lower()
-                combined_text = " ".join([text, aria_label]).strip()
-
-                if any(keyword in combined_text for keyword in remove_keywords):
-                    if self.config.DRY_RUN:
-                        self.logger.info(f"[DRY RUN] Would click: {text}")
-                        return True
-
-                    self.driver.execute_script("arguments[0].click();", item)
-                    return True
-
-            except Exception:
-                continue
-
-        return False
-
-    def _confirm_removal_modal(self) -> bool:
-        """Confirm removal in modal"""
-        try:
-            self.wait.until(EC.presence_of_element_located((By.XPATH, "//div[@role='dialog']//button")))
-        except TimeoutException:
-            time.sleep(1.0)
-            return not self.checker.is_connected()
-
-        buttons = self.driver.find_elements(By.XPATH, "//div[@role='dialog']//button")
-        confirm_keywords = ["remove", "disconnect", "confirm", "yes", "ok"]
-
-        for button in buttons:
-            try:
-                text = (button.text or "").strip().lower()
-                if any(keyword in text for keyword in confirm_keywords):
-                    if self.config.DRY_RUN:
-                        self.logger.info(f"[DRY RUN] Would confirm: {text}")
-                        return True
-
-                    self.driver.execute_script("arguments[0].click();", button)
-                    time.sleep(0.6)
-                    return not self.checker.is_connected()
-
-            except Exception:
-                continue
-
-        return False
-
-    def remove_connection(self, profile_url: str) -> Tuple[bool, str, str, str]:
-        """Remove LinkedIn connection"""
-        error_msg = ""
-        screenshot = ""
-        html = ""
-
-        try:
-            self.driver.get(profile_url)
-            self.wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-            time.sleep(1.5)
-
-            # Check if connected
-            if not self.checker.is_connected():
-                return False, "Not connected", "", ""
-
-            # Find More button
-            if not self._find_more_button():
-                error_msg = "More button not found"
-                screenshot, html = self.save_debug_snapshot(self._profile_slug_from_url(profile_url) + "_no_more")
-                return False, error_msg, screenshot, html
-
-            # Find remove option
-            if not self._find_remove_menu_item():
-                error_msg = "Remove option not found"
-                screenshot, html = self.save_debug_snapshot(self._profile_slug_from_url(profile_url) + "_no_remove")
-                return False, error_msg, screenshot, html
-
-            # Confirm removal
-            if not self._confirm_removal_modal():
-                error_msg = "Confirmation failed"
-                screenshot, html = self.save_debug_snapshot(self._profile_slug_from_url(profile_url) + "_no_confirm")
-                return False, error_msg, screenshot, html
-
-            return True, "", "", ""
-
-        except Exception as e:
-            error_msg = str(e)
-            screenshot, html = self.save_debug_snapshot(self._profile_slug_from_url(profile_url) + "_error")
-            return False, error_msg, screenshot, html
-
-
-class ResultsManager:
-    """Manages results logging"""
-
-    def __init__(self, results_path: str, logger: Logger):
-        self.results_path = results_path
-        self.logger = logger
-        self._ensure_results_file()
-
-    def _ensure_results_file(self):
-        """Create results file"""
-        os.makedirs(os.path.dirname(self.results_path), exist_ok=True)
-
-        if not os.path.exists(self.results_path):
-            headers = ["timestamp", "url", "removed", "error", "screenshot", "html"]
-            try:
-                with open(self.results_path, "w", newline="", encoding="utf-8") as f:
-                    writer = csv.DictWriter(f, fieldnames=headers)
-                    writer.writeheader()
-            except Exception as e:
-                self.logger.error(f"Results file creation failed: {e}")
-
-    def append_result(self, url: str, removed: bool, error: str = "", screenshot: str = "", html: str = ""):
-        """Append result"""
-        row = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "url": url,
-            "removed": removed,
-            "error": error,
-            "screenshot": screenshot,
-            "html": html,
-        }
-
-        try:
-            with open(self.results_path, "a", newline="", encoding="utf-8") as f:
-                headers = ["timestamp", "url", "removed", "error", "screenshot", "html"]
-                writer = csv.DictWriter(f, fieldnames=headers)
-                writer.writerow(row)
-        except Exception as e:
-            self.logger.error(f"Result write failed: {e}")
-
-
-class LoginManager:
-    """Manages LinkedIn login"""
-
-    def __init__(self, driver: webdriver.Chrome, wait: WebDriverWait, config: Config, logger: Logger):
-        self.driver = driver
-        self.wait = wait
-        self.config = config
-        self.logger = logger
-
-    def ensure_logged_in(self) -> bool:
-        """Ensure logged into LinkedIn"""
-        self.driver.get("https://www.linkedin.com/feed")
-        time.sleep(3)
-
-        current_url = self.driver.current_url.lower()
-        if "login" in current_url or self.driver.find_elements(By.ID, "username"):
-            print("\n" + "=" * 50)
-            print("Please login to LinkedIn in Chrome")
-            print("Press ENTER after login...")
-            print("=" * 50)
-            input()
-
-            self.driver.get("https://www.linkedin.com/feed")
-            time.sleep(3)
-
-            current_url = self.driver.current_url.lower()
-            if "login" in current_url or self.driver.find_elements(By.ID, "username"):
-                return False
-
-        return True
-
-
-def smart_delay(config: Config):
-    """Smart delay"""
-    base_delay = random.uniform(config.MIN_DELAY, config.MAX_DELAY)
-    if random.random() < 0.1:
-        base_delay += random.uniform(5, 15)
-    time.sleep(base_delay)
-
-
-def show_progress(current: int, total: int, url: str, removed_count: int):
-    """Show progress"""
-    percentage = (current / total) * 100
-    print(f"\n{'=' * 50}")
-    print(f"Progress: {current}/{total} ({percentage:.1f}%)")
-    print(f"Removed: {removed_count}")
-    print(f"URL: {url}")
-    print(f"{'=' * 50}")
-
-
-def main():
-    """Main function"""
-    config = Config()
-    logger = Logger()
-
-    # Create directories
-    os.makedirs(config.OUTPUT_DEBUG_DIR, exist_ok=True)
-    os.makedirs(os.path.dirname(config.RESULTS_CSV), exist_ok=True)
-    os.makedirs(os.path.dirname(config.CSV_FILE_PATH), exist_ok=True)
-
-    logger.info("Starting LinkedIn connection removal")
-    logger.info(f"DRY RUN: {config.DRY_RUN}")
-
-    # Initialize managers
-    csv_manager = CSVManager(config.CSV_FILE_PATH, config.BACKUP_CSV, logger)
-    urls = csv_manager.read_urls()
-
-    if not urls:
-        logger.error("No URLs found!")
-        return
-
-    results_manager = ResultsManager(config.RESULTS_CSV, logger)
-    chrome_manager = ChromeManager(config, logger)
 
     try:
-        driver, wait = chrome_manager.setup()
-        logger.info("Chrome started")
+        candidates = driver.find_elements(By.XPATH,
+                                          "//div[@role='menu']//button | //div[@role='menu']//a | //div[@role='menu']//div[@role='menuitem'] | //div[@role='menu']//div[@role='button'] | //div[contains(@class,'artdeco-popover__content')]//button | //div[contains(@class,'artdeco-popover__content')]//div[@role='button'] | //div[contains(@class,'artdeco-dropdown__content')]//*[(@role='button' or @role='menuitem') or self::button or self::a]"
+                                          )
+    except Exception:
+        candidates = []
 
-        login_manager = LoginManager(driver, wait, config, logger)
-        if not login_manager.ensure_logged_in():
-            logger.error("Login failed")
-            return
+    keywords = [
+        "remove connection", "remove connections", "disconnect", "remove"
+    ]
 
-        logger.info("Login successful")
+    for el in candidates:
+        try:
+            txt = (el.text or "").strip().lower()
+            if not txt:
+                txt = (el.get_attribute("innerText") or "").strip().lower()
+            aria = (el.get_attribute("aria-label") or "").strip().lower()
+            title = (el.get_attribute("title") or "").strip().lower()
+            combined = " ".join([txt, aria, title]).strip()
+            if "remove connection" in combined or "remove your connection" in combined or (
+                    "remove" in combined and "connection" in combined):
+                if dry_run:
+                    print(f"[dry-run] would click remove item: text='{txt}' aria='{aria}' title='{title}'")
+                    return True
+                try:
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                    time.sleep(0.12)
+                    driver.execute_script("arguments[0].click();", el)
+                    return True
+                except Exception:
+                    try:
+                        el.click()
+                        return True
+                    except Exception:
+                        continue
+            else:
+                for k in keywords:
+                    if k in combined:
+                        if dry_run:
+                            print(f"[dry-run] would click remove item (kw-match): '{k}' -> text='{txt}' aria='{aria}'")
+                            return True
+                        try:
+                            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                            time.sleep(0.12)
+                            driver.execute_script("arguments[0].click();", el)
+                            return True
+                        except Exception:
+                            try:
+                                el.click()
+                                return True
+                            except Exception:
+                                continue
+        except StaleElementReferenceException:
+            continue
+        except Exception:
+            continue
 
-        remover = LinkedInRemover(driver, wait, config, logger)
+    if debug:
+        try:
+            print("---- debug: menu candidates ----")
+            for i, el in enumerate(candidates, 1):
+                try:
+                    txt = (el.text or "").strip()
+                    aria = el.get_attribute("aria-label") or ""
+                    title = el.get_attribute("title") or ""
+                    cls = el.get_attribute("class") or ""
+                    print(f"{i:03d}: text='{txt}' | aria='{aria}' | title='{title}' | class='{cls}'")
+                except Exception:
+                    pass
+            print("---- end debug ----")
+        except Exception:
+            pass
 
-        # Process URLs
-        total_urls = len(urls)
-        removed_count = 0
+    return False
 
-        for i, url in enumerate(urls, 1):
-            show_progress(i, total_urls, url, removed_count)
 
+def confirm_remove_modal(driver: webdriver.Chrome, wait: WebDriverWait, dry_run: bool = False) -> bool:
+    try:
+        WebDriverWait(driver, 6).until(EC.presence_of_all_elements_located((By.XPATH,
+                                                                            "//div[@role='dialog']//button | //div[contains(@class,'artdeco-modal__actionbar')]//button"
+                                                                            )))
+    except Exception:
+        time.sleep(1.0)
+        try:
+            if not is_connected(driver):
+                return True
+        except Exception:
+            pass
+        try:
+            connect_btns = driver.find_elements(By.XPATH,
+                                                "//button[.//span[contains(text(),'Connect')] or contains(.,'Connect')]")
+            if connect_btns:
+                return True
+        except Exception:
+            pass
+        try:
+            toasts = driver.find_elements(By.XPATH,
+                                          "//*[(@role='status' or @aria-live='polite' or contains(@class,'toast') or contains(@class,'artdeco-toast'))]")
+            for t in toasts:
+                txt = (t.text or "").lower()
+                if any(k in txt for k in ("removed", "remove", "connection removed")):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    try:
+        buttons = driver.find_elements(By.XPATH,
+                                       "//div[@role='dialog']//button | //div[contains(@class,'artdeco-modal__actionbar')]//button")
+    except Exception:
+        buttons = []
+
+    confirm_texts = ["remove", "disconnect", "confirm", "yes", "ok"]
+    for b in buttons:
+        try:
+            txt = (b.text or "").strip().lower()
+            if not txt:
+                txt = (b.get_attribute("innerText") or "").strip().lower()
+            if any(k in txt for k in confirm_texts):
+                if dry_run:
+                    print(f"[dry-run] would click confirm button with text: {txt}")
+                    return True
+                try:
+                    driver.execute_script("arguments[0].click();", b)
+                    time.sleep(0.6)
+                    try:
+                        if not is_connected(driver):
+                            return True
+                    except Exception:
+                        pass
+                    return True
+                except Exception:
+                    try:
+                        b.click()
+                        time.sleep(0.6)
+                        try:
+                            if not is_connected(driver):
+                                return True
+                        except Exception:
+                            pass
+                        return True
+                    except Exception:
+                        continue
+        except StaleElementReferenceException:
+            continue
+    return False
+
+
+def ensure_profile_marker(user_data_dir: str) -> bool:
+    marker = os.path.join(user_data_dir, PROFILE_MARKER_FILENAME)
+    return os.path.exists(marker)
+
+
+def write_profile_marker(user_data_dir: str) -> None:
+    marker = os.path.join(user_data_dir, PROFILE_MARKER_FILENAME)
+    try:
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write(f"initialized_at={int(time.time())}\n")
+    except Exception:
+        pass
+
+
+def ensure_logged_in_state(driver: webdriver.Chrome, wait: WebDriverWait, user_data_dir: str) -> bool:
+    driver.get("https://www.linkedin.com/feed")
+    time.sleep(3)
+    need_manual_login = False
+    try:
+        if "login" in driver.current_url:
+            need_manual_login = True
+    except Exception:
+        pass
+    try:
+        if driver.find_elements(By.ID, "username"):
+            need_manual_login = True
+    except Exception:
+        pass
+
+    if need_manual_login:
+        print("Profile not logged in. Please log in to LinkedIn in the opened Chrome window and press ENTER here.")
+        input()
+        driver.get("https://www.linkedin.com/feed")
+        time.sleep(3)
+        try:
+            if "login" in driver.current_url or driver.find_elements(By.ID, "username"):
+                print("Still not logged in.")
+                return False
+        except Exception:
+            return False
+
+    write_profile_marker(user_data_dir)
+    return True
+
+
+def prepare_chrome_and_driver() -> Tuple[webdriver.Chrome, WebDriverWait, subprocess.Popen]:
+    if not os.path.exists(CHROME_USER_DATA_DIR):
+        os.makedirs(CHROME_USER_DATA_DIR, exist_ok=True)
+
+    port = find_free_port()
+    chrome_bin = pick_chrome_binary()
+    chrome_proc = create_chrome_process(CHROME_USER_DATA_DIR, CHROME_PROFILE_DIR, port, chrome_bin)
+
+    ok = wait_for_port("127.0.0.1", port, timeout=25.0)
+    if not ok:
+        try:
+            chrome_proc.terminate()
+        except Exception:
+            pass
+        raise RuntimeError("Chrome failed to open remote debugging port or started too slowly.")
+
+    driver = create_driver_attaching_to_chrome(port)
+    wait = WebDriverWait(driver, 12)
+
+    first_time = not ensure_profile_marker(CHROME_USER_DATA_DIR)
+    ok_login = ensure_logged_in_state(driver, wait, CHROME_USER_DATA_DIR)
+    if not ok_login:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        try:
+            chrome_proc.terminate()
+        except Exception:
+            pass
+        raise RuntimeError("Login required but not completed.")
+
+    return driver, wait, chrome_proc
+
+
+def append_result_row(row: dict) -> None:
+    header = ["timestamp", "url", "removed", "error", "screenshot", "html"]
+    write_header = not os.path.exists(RESULTS_CSV)
+    try:
+        with open(RESULTS_CSV, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=header)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+    except Exception:
+        pass
+
+
+def run_main():
+    if not os.path.exists(CSV_FILE_PATH):
+        print(f"CSV file not found: {CSV_FILE_PATH}")
+        return
+
+    df = pd.read_csv(CSV_FILE_PATH)
+    linkedin_profiles = df['URL'].dropna().tolist()
+    if not linkedin_profiles:
+        print("No URLs found in CSV.")
+        return
+
+    try:
+        driver, wait, chrome_proc = prepare_chrome_and_driver()
+    except Exception as e:
+        print("Error preparing driver/profile:", e)
+        return
+
+    try:
+        for profile in linkedin_profiles:
+            removed = False
+            error_msg = ""
+            screenshot = ""
+            html = ""
             try:
-                success, error, screenshot, html = remover.remove_connection(url)
+                driver.get(profile)
+                wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+                time.sleep(1.2 + random.random() * 1.4)
 
-                if success:
-                    removed_count += 1
-                    logger.info(f"SUCCESS: {url}")
-
-                    if config.REMOVE_FROM_CSV and not config.DRY_RUN:
-                        csv_manager.remove_url(url)
+                connected = is_connected(driver)
+                if not connected:
+                    print(f"Not a 1st-degree connection, skipping remove: {profile}")
                 else:
-                    logger.warning(f"FAILED: {url} - {error}")
-
-                results_manager.append_result(url, success, error, screenshot, html)
-
-                if i < total_urls:
-                    smart_delay(config)
+                    clicked_more = find_click_more_button(driver, wait, debug=False)
+                    if not clicked_more:
+                        error_msg = "Could not open More menu"
+                        print(f"{error_msg}: {profile}")
+                        screenshot, html = save_debug_snapshot(driver, profile_slug_from_url(profile) + "_no_more")
+                    else:
+                        removed = find_and_click_menu_item_remove(driver, wait, dry_run=DRY_RUN, debug=False)
+                        if not removed:
+                            error_msg = "Menu opened but no 'Remove connection' item found"
+                            print(f"{error_msg}: {profile}")
+                            if not screenshot:
+                                screenshot, html = save_debug_snapshot(driver, profile_slug_from_url(
+                                    profile) + "_no_remove_item")
+                        else:
+                            confirmed = confirm_remove_modal(driver, wait, dry_run=DRY_RUN)
+                            if not confirmed:
+                                time.sleep(0.6)
+                                if not is_connected(driver):
+                                    confirmed = True
+                                    print(f"Removal inferred (no modal shown) for: {profile}")
+                                else:
+                                    print(f"Modal confirm not found and still appears connected: {profile}")
+                            if confirmed:
+                                print(
+                                    f"Removed connection: {profile}" if not DRY_RUN else f"[dry-run] Removed (simulated): {profile}")
+                                removed = True
 
             except KeyboardInterrupt:
-                logger.info("Stopped by user")
+                print("Interrupted by user.")
                 break
             except Exception as e:
-                logger.error(f"Error: {url} - {e}")
-                results_manager.append_result(url, False, str(e))
+                error_msg = str(e)
+                print(f"Unexpected error for {profile}: {error_msg}")
+                screenshot, html = save_debug_snapshot(driver, profile_slug_from_url(profile) + "_error")
 
-        # Summary
-        remaining_count = csv_manager.get_remaining_count()
-        print(f"\n{'=' * 50}")
-        print(f"COMPLETED!")
-        print(f"Total: {total_urls}")
-        print(f"Removed: {removed_count}")
-        print(f"Remaining: {remaining_count}")
-        print(f"Results: {config.RESULTS_CSV}")
-        print(f"Backup: {config.BACKUP_CSV}")
-        print(f"{'=' * 50}")
+            row = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "url": profile,
+                "removed": bool(removed),
+                "error": error_msg,
+                "screenshot": screenshot,
+                "html": html,
+            }
+            append_result_row(row)
 
-        logger.info(f"Done! {removed_count}/{total_urls} removed")
-
-    except Exception as e:
-        logger.error(f"Error: {e}")
+            time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
     finally:
-        chrome_manager.cleanup()
-        logger.info("Cleanup complete")
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        try:
+            chrome_proc.terminate()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
-    main()
+    run_main()
