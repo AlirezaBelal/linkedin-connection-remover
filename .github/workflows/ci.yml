@@ -42,7 +42,10 @@ jobs:
         run: python -m compileall -q connection_remover.py remove_linkedin_connections.py tests
 
       - name: Run unit tests
-        run: python -m unittest discover -s tests -v
+        run: python -m unittest discover -s tests -p 'test_connection_remover.py' -v
+
+      - name: Run fixture integration tests
+        run: python -m unittest discover -s tests -p 'test_dom_fixtures.py' -v
 
       - name: Validate placeholder input
         run: python remove_linkedin_connections.py --input data/Connections.example.csv --validate-input

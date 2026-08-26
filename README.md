@@ -148,7 +148,9 @@ Screenshots may contain private account information. They are stored under ignor
 
 ## Testing and CI
 
-Tests are deliberately offline and do not connect to LinkedIn. They cover:
+Tests are deliberately offline and do not connect to LinkedIn. The test suite has two layers.
+
+Unit tests cover:
 
 - strict URL validation and canonicalization;
 - duplicate handling and batch caps;
@@ -158,7 +160,20 @@ Tests are deliberately offline and do not connect to LinkedIn. They cover:
 - challenge-path detection;
 - CLI validation using placeholder input.
 
-GitHub Actions tests Python 3.10 through 3.14 and runs dependency auditing. CI never performs account actions or sends traffic to LinkedIn.
+Fixture-based integration tests exercise the production `LinkedInBrowser.process_target()` flow against static HTML DOM fixtures through an offline fake driver. They verify:
+
+- dry-run discovers an exact removal action without clicking it;
+- live mode submits only an exact `Remove` confirmation;
+- duplicate or ambiguous removal actions fail closed;
+- ambiguous confirmation buttons fail closed;
+- misleading dialogs fail closed;
+- checkpoint/challenge fixtures abort before any profile action is clicked.
+
+GitHub Actions runs both layers on Python 3.10 through 3.14 and runs dependency auditing. CI never launches a LinkedIn session, performs account actions, or sends traffic to LinkedIn.
+
+## Release
+
+The repository version is tracked in `VERSION`, and notable changes are documented in `CHANGELOG.md`. The first stable code baseline is `1.0.0`.
 
 ## Project scope
 
