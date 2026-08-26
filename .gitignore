@@ -1,25 +1,26 @@
 # Python
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-.Python
-env/
 .venv/
 venv/
+env/
 
-# IDEs
-.idea/
-.vscode/
-
-# Chrome user data (do not commit)
+# Local browser/session data
+.local/
 chrome-user-data/
 
-# Output debug snapshots and results
-output/debug/
-output/results.csv
+# Private input and generated output
+data/Connections.csv
+output/
 *.log
 
-# System
+# IDE / OS
+.idea/
+.vscode/
 .DS_Store
 Thumbs.db
+
+# Test / tooling artifacts
+.pytest_cache/
+.coverage
+htmlcov/
