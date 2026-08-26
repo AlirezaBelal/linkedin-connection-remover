@@ -1,19 +1,19 @@
 """Safety-first LinkedIn connection-removal workflow.
 
-The module intentionally keeps destructive behavior behind an explicit execution
-mode and exact UI semantics. It does not attempt to bypass login challenges,
-CAPTCHAs, rate limits, or other platform protections.
+Destructive behavior is gated behind explicit execution mode and exact UI
+semantics. The module does not attempt to bypass login challenges, CAPTCHAs,
+rate limits, or other platform protections.
 """
 
 from __future__ import annotations
 
+import csv
+import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
-import csv
 from pathlib import Path
-import re
-import time
 from typing import Callable, Iterable, Optional, Sequence
 from urllib.parse import urlparse
 
@@ -23,6 +23,11 @@ PROFILE_PATH_RE = re.compile(r"^/in/([A-Za-z0-9._~%-]{1,200})/?$")
 MAX_BATCH_LIMIT = 50
 REMOVE_LABEL_RE = re.compile(r"^remove (?:your )?connection(?: with .+)?$", re.IGNORECASE)
 CHALLENGE_PATH_MARKERS = ("/checkpoint/", "/challenge/", "/captcha/")
+DIALOG_REMOVAL_PATTERNS = (
+    re.compile(r"\bremove connection\b", re.IGNORECASE),
+    re.compile(r"\bremove (?:this|your) connection\b", re.IGNORECASE),
+    re.compile(r"\bremove .{1,80} from (?:your )?connections\b", re.IGNORECASE),
+)
 
 
 class RemovalError(RuntimeError):
@@ -85,8 +90,7 @@ def normalize_profile_url(raw_url: str) -> str:
     if not match:
         raise ConfigurationError("profile URL must match https://www.linkedin.com/in/<profile>/")
 
-    slug = match.group(1)
-    return f"https://www.linkedin.com/in/{slug}/"
+    return f"https://www.linkedin.com/in/{match.group(1)}/"
 
 
 def target_ref_for_url(url: str) -> str:
@@ -175,6 +179,12 @@ def choose_confirmation_label(labels: Sequence[str]) -> Optional[int]:
     return matches[0] if len(matches) == 1 else None
 
 
+def dialog_describes_connection_removal(text: object) -> bool:
+    """Require an affirmative, explicit connection-removal phrase in a dialog."""
+    normalized = " ".join(str(text or "").strip().split())
+    return any(pattern.search(normalized) for pattern in DIALOG_REMOVAL_PATTERNS)
+
+
 def is_challenge_url(url: str) -> bool:
     path = urlparse(str(url or "")).path.casefold()
     return any(marker in path for marker in CHALLENGE_PATH_MARKERS)
@@ -243,7 +253,6 @@ class LinkedInBrowser:
         options.add_argument(f"--user-data-dir={self.profile_dir.resolve()}")
         options.add_argument("--no-first-run")
         options.add_argument("--no-default-browser-check")
-        options.add_argument("--remote-debugging-address=127.0.0.1")
         try:
             self.driver = webdriver.Chrome(options=options)
         except Exception as exc:
@@ -275,7 +284,12 @@ class LinkedInBrowser:
             )
             self.driver.get("https://www.linkedin.com/feed/")
             self._stop_on_challenge()
-            if "login" in str(self.driver.current_url).casefold():
+            still_login = "login" in str(self.driver.current_url).casefold()
+            try:
+                still_login = still_login or bool(self.driver.find_elements(By.ID, "username"))
+            except Exception:
+                pass
+            if still_login:
                 raise SafetyStop("manual login was not completed")
 
     def _stop_on_challenge(self) -> None:
@@ -311,7 +325,7 @@ class LinkedInBrowser:
                 return value
         return ""
 
-    def _open_more_menu(self):
+    def _open_more_menu(self) -> None:
         if self.driver is None:
             raise RemovalError("browser is not started")
         _webdriver, By, EC, WebDriverWait = self._selenium()
@@ -355,7 +369,9 @@ class LinkedInBrowser:
             "//div[contains(@class,'artdeco-dropdown__content')]//*[@role='menuitem' or self::button or self::a]"
         )
         try:
-            candidates = [item for item in self.driver.find_elements(By.XPATH, xpath) if item.is_displayed()]
+            candidates = [
+                item for item in self.driver.find_elements(By.XPATH, xpath) if item.is_displayed()
+            ]
         except Exception as exc:
             raise SafetyStop("unable to inspect the profile actions menu") from exc
         labels = [self._element_label(item) for item in candidates]
@@ -373,9 +389,10 @@ class LinkedInBrowser:
             dialog = wait.until(EC.presence_of_element_located((By.XPATH, "//div[@role='dialog']")))
         except Exception as exc:
             raise SafetyStop("removal confirmation dialog did not appear") from exc
-        dialog_text = normalize_ui_text(getattr(dialog, "text", ""))
-        if "remove" not in dialog_text or "connection" not in dialog_text:
+
+        if not dialog_describes_connection_removal(getattr(dialog, "text", "")):
             raise SafetyStop("confirmation dialog did not clearly describe connection removal")
+
         try:
             buttons = [
                 button
@@ -406,7 +423,12 @@ class LinkedInBrowser:
                 return RemovalResult(target.target_ref, mode, "eligible", "exact action found")
             remove_item.click()
             self._confirm_remove_modal()
-            return RemovalResult(target.target_ref, mode, "submitted", "remove confirmation submitted")
+            return RemovalResult(
+                target.target_ref,
+                mode,
+                "submitted",
+                "remove confirmation submitted",
+            )
         except ChallengeStop:
             self._snapshot(target.target_ref, "challenge-stop")
             raise

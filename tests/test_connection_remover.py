@@ -10,6 +10,7 @@ from connection_remover import (
     choose_confirmation_label,
     choose_remove_label,
     confirm_live_execution,
+    dialog_describes_connection_removal,
     is_challenge_url,
     load_targets,
     normalize_profile_url,
@@ -97,6 +98,20 @@ class SafetySemanticsTests(unittest.TestCase):
         self.assertIsNone(choose_confirmation_label(["Cancel", "Yes"]))
         self.assertIsNone(choose_confirmation_label(["Remove", "Remove"]))
 
+    def test_dialog_requires_affirmative_connection_removal_phrase(self):
+        self.assertTrue(dialog_describes_connection_removal("Remove connection?"))
+        self.assertTrue(
+            dialog_describes_connection_removal("Are you sure you want to remove this connection?")
+        )
+        self.assertTrue(
+            dialog_describes_connection_removal("Remove Example Person from your connections?")
+        )
+        self.assertFalse(
+            dialog_describes_connection_removal(
+                "Remove saved item? This dialog does not describe connection removal."
+            )
+        )
+
     def test_challenge_detection_stops_known_paths(self):
         self.assertTrue(is_challenge_url("https://www.linkedin.com/checkpoint/challenge/abc"))
         self.assertTrue(is_challenge_url("https://www.linkedin.com/challenge/abc"))
@@ -108,7 +123,14 @@ class ResultsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "results.csv"
             writer = ResultsWriter(path)
-            writer.append(RemovalResult("abcdef1234567890", "dry-run", "eligible", "exact action found"))
+            writer.append(
+                RemovalResult(
+                    "abcdef1234567890",
+                    "dry-run",
+                    "eligible",
+                    "exact action found",
+                )
+            )
             text = path.read_text(encoding="utf-8")
             self.assertIn("target_ref", text)
             self.assertNotIn("linkedin.com/in/", text)
