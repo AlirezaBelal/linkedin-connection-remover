@@ -47,6 +47,9 @@ jobs:
       - name: Run fixture integration tests
         run: python -m unittest discover -s tests -p 'test_dom_fixtures.py' -v
 
+      - name: Run CLI safety tests
+        run: python -m unittest discover -s tests -p 'test_cli.py' -v
+
       - name: Validate placeholder input
         run: python remove_linkedin_connections.py --input data/Connections.example.csv --validate-input
 
