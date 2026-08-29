@@ -1,6 +1,18 @@
 # LinkedIn Connection Remover
 
+[![CI](https://github.com/AlirezaBelal/linkedin-connection-remover/actions/workflows/ci.yml/badge.svg)](https://github.com/AlirezaBelal/linkedin-connection-remover/actions/workflows/ci.yml)
+
 A safety-first, browser-assisted Python utility for reviewing a bounded list of LinkedIn profile connections and, only after explicit confirmation, submitting removal actions.
+
+## Product / operational context
+
+The practical problem is not simply "automate a click." Connection cleanup is a destructive account-maintenance task where the cost of a false positive is higher than the cost of skipping an uncertain target.
+
+This project therefore optimizes for four operator outcomes:
+
+**reviewability · explicit control · bounded execution · privacy-safe evidence**
+
+The workflow is designed for a person cleaning up their own account from a prepared list. It makes the proposed action observable in dry-run mode first, requires an intentional live-execution gate, limits batch size, and records only privacy-safe outcome references. It deliberately prefers a skipped action over an ambiguous destructive action.
 
 ## Why this version is different
 
